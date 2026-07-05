@@ -32,6 +32,7 @@ class Signals(QObject):
     text_ready = Signal(str)
     status_update = Signal(str)
     history_added = Signal(dict)
+    model_ready = Signal()
 
 class Transcriber(QMainWindow):
     def __init__(self):
@@ -44,6 +45,7 @@ class Transcriber(QMainWindow):
         self.signals.text_ready.connect(self.append_text)
         self.signals.status_update.connect(self.update_status)
         self.signals.history_added.connect(self.add_history_item)
+        self.signals.model_ready.connect(self.on_model_ready)
         self.model = None
         self.init_ui()
         threading.Thread(target=self.load_model, daemon=True).start()
@@ -129,8 +131,15 @@ class Transcriber(QMainWindow):
             self.signals.status_update.emit(f"Model ready (GPU, {MODEL_NAME})! Press RECORD.")
         except Exception as e:
             self.signals.status_update.emit(f"GPU failed ({e}), loading on CPU...")
-            self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
-            self.signals.status_update.emit(f"Model ready (CPU, {MODEL_NAME}). Press RECORD.")
+            try:
+                self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+                self.signals.status_update.emit(f"Model ready (CPU, {MODEL_NAME}). Press RECORD.")
+            except Exception as e:
+                self.signals.status_update.emit(f"Model load failed: {e}")
+                return
+        self.signals.model_ready.emit()
+
+    def on_model_ready(self):
         self.record_btn.setEnabled(True)
 
     def update_status(self, text):
@@ -161,23 +170,32 @@ class Transcriber(QMainWindow):
             self.audio_data.append(indata.copy())
 
     def transcribe(self):
-        audio = np.concatenate(self.audio_data, axis=0).flatten()
-        segments, _ = self.model.transcribe(
-            audio, language="ru", beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            temperature=0,
-            hotwords="Claude, Claude Code, API, Anthropic, skill, workspace",
-        )
-        text = " ".join(
-            t for s in segments
-            if not HALLUCINATION_SEGMENTS.match(t := s.text.strip())
-        )
-        self.save_history(text)
-        self.signals.text_ready.emit(text + "\n")
-        self.signals.status_update.emit("Done! Press RECORD for next.")
+        if not self.audio_data:
+            self.signals.status_update.emit("No audio captured. Press RECORD.")
+            return
+        try:
+            audio = np.concatenate(self.audio_data, axis=0).flatten()
+            segments, _ = self.model.transcribe(
+                audio, language="ru", beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                temperature=0,
+                hotwords="Claude, Claude Code, API, Anthropic, skill, workspace",
+            )
+            parts = []
+            for s in segments:
+                t = s.text.strip()
+                if not t or HALLUCINATION_SEGMENTS.match(t):
+                    continue
+                parts.append(t)
+            text = " ".join(parts)
+            self.save_history(text)
+            self.signals.text_ready.emit(text + "\n")
+            self.signals.status_update.emit("Done! Press RECORD for next.")
+        except Exception as e:
+            self.signals.status_update.emit(f"Transcription failed: {e}")
 
     def save_history(self, text):
         if not text.strip():
@@ -187,8 +205,9 @@ class Transcriber(QMainWindow):
             with open(HISTORY_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             self.signals.history_added.emit(entry)
-        except Exception:
-            pass  # история не должна ронять транскрипцию
+        except OSError as e:
+            # история не должна ронять транскрипцию
+            self.signals.status_update.emit(f"History save failed: {e}")
 
     def load_history(self):
         try:
@@ -196,7 +215,8 @@ class Transcriber(QMainWindow):
                 lines = f.readlines()
         except OSError:
             return
-        for line in lines:
+        self.history_list.setUpdatesEnabled(False)
+        for line in reversed(lines):  # файл хронологический, показываем новые первыми
             line = line.strip()
             if not line:
                 continue
@@ -204,8 +224,9 @@ class Transcriber(QMainWindow):
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            self.history_entries.insert(0, entry)
-            self.history_list.insertItem(0, self.history_label(entry))
+            self.history_entries.append(entry)
+            self.history_list.addItem(self.history_label(entry))
+        self.history_list.setUpdatesEnabled(True)
 
     def clear_history(self, keep_days=None):
         if not self.history_entries:
@@ -219,7 +240,9 @@ class Transcriber(QMainWindow):
                 ts = datetime.datetime.fromisoformat(e.get("ts", ""))
             except ValueError:
                 ts = None
-            if cutoff is not None and ts is not None and ts >= cutoff:
+            if ts is None:
+                keep.append(e)  # непарсибельный ts — не удаляем, консервативный дефолт
+            elif cutoff is not None and ts >= cutoff:
                 keep.append(e)
             else:
                 drop.append(e)
@@ -230,6 +253,8 @@ class Transcriber(QMainWindow):
             self, "Очистить историю",
             f"Убрать записей: {len(drop)} (останется {len(keep)}).\n"
             f"Они будут перенесены в архивный файл:\n{ARCHIVE_PATH}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -255,7 +280,7 @@ class Transcriber(QMainWindow):
 
     def show_history_entry(self, row):
         if 0 <= row < len(self.history_entries):
-            self.history_view.setPlainText(self.history_entries[row]["text"])
+            self.history_view.setPlainText(self.history_entries[row].get("text", ""))
 
     @staticmethod
     def history_label(entry):
